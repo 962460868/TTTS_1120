@@ -60,6 +60,13 @@ VIDEO_RESTORE_NODE_INFO = [
     {"nodeId": "36", "fieldName": "video", "fieldValue": "placeholder.mp4", "description": "video"}
 ]
 
+# 抠图（和视频修复共享APIkey，并发限制5）
+MATTING_API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"  # 与视频修复共享
+MATTING_WEBAPP_ID = "1991469920194142210"
+MATTING_NODE_INFO = [
+    {"nodeId": "122", "fieldName": "image", "fieldValue": "placeholder.png", "description": "image"}
+]
+
 # 图像优化 WAN 2.2 (新版API，支持正反提示词)
 ENHANCE_API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"
 ENHANCE_WEBAPP_ID_V2_2 = "1986501194824773634"
@@ -782,6 +789,7 @@ enhance_queue_global = []
 watermark_queue_global = []  # 去水印队列
 lighting_queue_global = []  # 融图打光队列
 pose_queue_global = []  # 姿态迁移队列
+matting_queue_global = []  # 抠图队列
 video_restore_queue_global = []  # 视频修复队列
 
 # 线程安全的任务队列（用于后台处理）
@@ -789,11 +797,11 @@ task_queue = queue.Queue()  # 待处理任务队列
 
 processing_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=50)  # 50并发（图像优化、去水印、融图打光、姿态迁移共享）
-video_executor = ThreadPoolExecutor(max_workers=5)  # 5并发（视频修复专用）
+video_executor = ThreadPoolExecutor(max_workers=5)  # 5并发（视频修复和抠图共享，共享同一个APIkey）
 
 # 使用字典而不是set，记录任务ID和开始时间，便于泄漏检测和清理
 active_tasks = {}  # {task_id: start_time}
-video_active_tasks = {}  # {task_id: start_time}
+video_active_tasks = {}  # {task_id: start_time} 视频修复和抠图共享
 
 # 任务超时时间（秒）- 防止任务泄漏
 TASK_TIMEOUT = 3600  # 1小时超时自动清理
@@ -942,22 +950,34 @@ def start_background_processing():
             logger.info("✅ 后台任务处理线程已创建")
 
 def start_video_processing():
-    """启动视频修复后台处理线程（限制2并发，视频处理更消耗资源）"""
+    """启动视频修复和抠图后台处理线程（限制5并发，共享APIkey）"""
     global video_active_tasks
 
     with processing_lock:
         # 获取所有待处理的视频修复任务
         pending_video_tasks = [task for task in video_restore_queue_global if task["status"] == "pending"]
 
-        # 计算可以启动的新任务数量（视频处理限制为2，避免内存溢出）
-        available_slots = min(2 - len(video_active_tasks), 5 - len(video_active_tasks))
+        # 获取所有待处理的抠图任务
+        pending_matting_tasks = [task for task in matting_queue_global if task["status"] == "pending"]
+
+        # 合并所有待处理任务（视频和抠图共享5并发）
+        all_pending_tasks = pending_video_tasks + pending_matting_tasks
+
+        # 计算可以启动的新任务数量（共享5并发限制）
+        available_slots = 5 - len(video_active_tasks)
 
         # 提交新任务到视频线程池
-        for task in pending_video_tasks[:available_slots]:
+        for task in all_pending_tasks[:available_slots]:
             if task["id"] not in video_active_tasks:
-                video_active_tasks.add(task["id"])
-                logger.info(f"🚀 提交视频修复任务到线程池: {task['id']} (当前活跃: {len(video_active_tasks)}/5)")
-                video_executor.submit(process_video_restore_item_wrapper, task)
+                video_active_tasks[task["id"]] = time.time()  # 记录开始时间
+                task_type = "抠图" if task.get("task_type") == "matting" else "视频修复"
+                logger.info(f"🚀 提交{task_type}任务到线程池: {task['id']} (当前活跃: {len(video_active_tasks)}/5)")
+
+                # 根据任务类型选择处理函数
+                if task.get("task_type") == "matting":
+                    video_executor.submit(process_matting_item_wrapper, task)
+                else:
+                    video_executor.submit(process_video_restore_item_wrapper, task)
 
 def process_single_item_wrapper(item):
     """包装器：处理单个任务并更新活跃任务集"""
@@ -2026,6 +2046,239 @@ def clear_lighting_queue():
     lighting_queue_global = []
     return None, [], "✅ 队列已清空"
 
+# --- 抠图队列管理函数 ---
+def add_matting_to_queue(files, queue_state):
+    """添加文件到抠图队列（自动触发）"""
+    global matting_queue_global
+
+    if not files:
+        return None, queue_state, render_matting_queue_dataframe(queue_state), "⚠️ 未选择文件"
+
+    # 初始化队列
+    if queue_state is None:
+        queue_state = []
+
+    # 添加新文件到队列
+    for file in files:
+        file_id = str(uuid.uuid4())[:8]
+        item = {
+            "id": file_id,
+            "file": file,
+            "task_type": "matting",  # 标记为抠图任务
+            "status": "pending",
+            "original": None,
+            "result": None,
+            "error": None,
+            "start_time": None
+        }
+        queue_state.append(item)
+        matting_queue_global.append(item)
+
+    # 启动视频处理线程（抠图和视频共享）
+    start_video_processing()
+
+    # 清空文件选择器并更新显示
+    return None, queue_state, render_matting_queue_dataframe(queue_state), f"✅ 已添加 {len(files)} 张图片到队列，正在处理中..."
+
+def process_matting_item_wrapper(item):
+    """包装器：处理单个抠图任务并更新活跃任务集"""
+    global video_active_tasks
+
+    try:
+        process_matting_item(item)
+    except Exception as e:
+        logger.error(f"抠图任务失败: {e}")
+        item["status"] = "error"
+        item["error"] = str(e)
+    finally:
+        # 任务完成后从活跃字典中移除（防止泄漏）
+        with processing_lock:
+            video_active_tasks.pop(item["id"], None)
+
+        # 强制垃圾回收，及时释放内存
+        gc.collect()
+
+def process_matting_item(item):
+    """处理单个抠图任务"""
+    try:
+        # 更新状态为处理中，记录开始时间
+        item["status"] = "processing"
+        item["start_time"] = time.time()
+        logger.info(f"📝 抠图任务 {item['id']} 状态: pending -> processing")
+
+        # 读取图片文件
+        img_data = item["file"]
+        img = Image.open(io.BytesIO(img_data))
+
+        # 保存原图（转为PNG）
+        original_buffer = io.BytesIO()
+        img.save(original_buffer, format='PNG')
+        item["original"] = original_buffer.getvalue()
+
+        # 上传文件
+        logger.info(f"⬆️ 抠图任务 {item['id']} 开始上传文件到API")
+        uploaded_filename = upload_file_with_retry(item["original"], "input.png", MATTING_API_KEY)
+
+        # 构建节点信息
+        node_info_list = copy.deepcopy(MATTING_NODE_INFO)
+        for node in node_info_list:
+            if node["nodeId"] == "122":
+                node["fieldValue"] = uploaded_filename
+
+        # 启动任务
+        logger.info(f"🎬 抠图任务 {item['id']} 提交API处理请求")
+        task_id = run_task_with_retry(MATTING_API_KEY, MATTING_WEBAPP_ID, node_info_list)
+
+        # 轮询状态
+        poll_count = 0
+        while poll_count < MAX_POLL_COUNT:
+            time.sleep(POLL_INTERVAL)
+            poll_count += 1
+            status = get_task_status(MATTING_API_KEY, task_id)
+
+            if status == "SUCCESS":
+                break
+            elif status == "FAILED":
+                raise Exception("API任务处理失败")
+
+        if poll_count >= MAX_POLL_COUNT:
+            raise Exception("任务超时")
+
+        # 获取结果
+        logger.info(f"⬇️ 抠图任务 {item['id']} 开始下载结果")
+        result_url = fetch_task_outputs(MATTING_API_KEY, task_id, "matting")
+        result_data = download_result_image(result_url)
+
+        # 转换为图片并保存
+        result_image = Image.open(io.BytesIO(result_data))
+        result_buffer = io.BytesIO()
+        result_image.save(result_buffer, format='PNG')
+        item["result"] = result_buffer.getvalue()
+        logger.info(f"💾 抠图任务 {item['id']} 已保存为PNG格式")
+
+        # 保存到永久存储
+        try:
+            save_material_to_storage(
+                task_id=item["id"],
+                task_type="matting",
+                parameters={},
+                original_data=item["original"],
+                result_data_list=[(item["result"], 'png')]
+            )
+        except Exception as e:
+            logger.error(f"保存素材到永久存储失败: {e}")
+
+        # 更新状态为完成
+        item["status"] = "completed"
+        logger.info(f"✅ 抠图任务 {item['id']} 完成！")
+
+    except Exception as e:
+        item["status"] = "error"
+        item["error"] = str(e)
+        logger.error(f"❌ 抠图任务 {item['id']} 失败: {str(e)}")
+        raise
+
+def get_matting_queue_status(queue_state):
+    """获取抠图队列状态（定时刷新）"""
+    if queue_state is None:
+        return queue_state, []
+    return queue_state, render_matting_queue_dataframe(queue_state)
+
+def render_matting_queue_dataframe(queue_state):
+    """渲染抠图队列为DataFrame数据"""
+    if not queue_state:
+        return []
+
+    data = []
+    for item in queue_state:
+        # 状态显示逻辑
+        status = item["status"]
+        if status == "pending":
+            status_display = "⏳ 等待中"
+        elif status == "processing":
+            start_time = item.get("start_time")
+            if start_time:
+                elapsed = time.time() - start_time
+                remaining = 120 - elapsed  # 120秒 = 2分钟
+
+                if remaining > 0:
+                    minutes = int(remaining // 60)
+                    seconds = int(remaining % 60)
+                    status_display = f"预计还剩{minutes}:{seconds:02d}"
+                else:
+                    status_display = "全力处理中~"
+            else:
+                status_display = "🔄 处理中"
+        elif status == "completed":
+            status_display = "✅ 已完成"
+        elif status == "error":
+            status_display = "❌ 失败"
+        else:
+            status_display = "未知"
+
+        # 操作列
+        view_text = "点击查看" if status == "completed" else "---"
+
+        data.append([
+            item["id"],
+            status_display,
+            view_text
+        ])
+
+    return data
+
+def handle_matting_dataframe_click(evt: gr.SelectData, queue_state):
+    """处理抠图DataFrame点击事件"""
+    if not queue_state or evt.index[0] >= len(queue_state):
+        return None, None
+
+    row_index = evt.index[0]
+    item = queue_state[row_index]
+
+    # 显示图片
+    if item["status"] == "completed" and item["original"] and item["result"]:
+        # 转换为PIL Image
+        original_img = Image.open(io.BytesIO(item["original"]))
+        result_img = Image.open(io.BytesIO(item["result"]))
+
+        # 统一高度到800px
+        target_height = 800
+
+        # 调整原图大小
+        orig_width, orig_height = original_img.size
+        if orig_height != target_height:
+            scale = target_height / orig_height
+            new_width = int(orig_width * scale)
+            original_img = original_img.resize((new_width, target_height), Image.LANCZOS)
+
+        # 调整结果图大小
+        result_width, result_height = result_img.size
+        if result_height != target_height:
+            scale = target_height / result_height
+            new_width = int(result_width * scale)
+            result_img = result_img.resize((new_width, target_height), Image.LANCZOS)
+
+        # 保存为PNG临时文件
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='_original.png', mode='wb') as f:
+            original_img.save(f, format='PNG')
+            original_temp_path = f.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='_matting.png', mode='wb') as f:
+            result_img.save(f, format='PNG')
+            result_temp_path = f.name
+
+        return original_temp_path, result_temp_path
+
+    return None, None
+
+def clear_matting_queue():
+    """清空抠图队列"""
+    global matting_queue_global
+    matting_queue_global = []
+    return None, [], "✅ 队列已清空"
+
 # --- 视频修复队列管理函数 ---
 def add_video_restore_to_queue(files, queue_state):
     """添加视频文件到修复队列（自动触发）"""
@@ -2344,6 +2597,7 @@ def render_materials_gallery(materials):
         "watermark_removal": "去水印",
         "lighting": "融图打光",
         "pose_transfer": "姿态迁移",
+        "matting": "抠图",
         "video_restore": "视频修复"
     }
 
@@ -2387,7 +2641,9 @@ def get_material_details(material_id):
             task_type_display = {
                 "image_enhance": "图像优化",
                 "watermark_removal": "去水印",
+                "lighting": "融图打光",
                 "pose_transfer": "姿态迁移",
+                "matting": "抠图",
                 "video_restore": "视频修复"
             }
 
@@ -2775,7 +3031,74 @@ def create_interface():
                     outputs=[pose_queue_state, pose_queue_display]
                 )
 
-            # 视频修复（第四栏 - 队列处理）
+            # 抠图（第五栏 - 队列处理）
+            with gr.Tab("✂️ 抠图"):
+                with gr.Row():
+                    # 左侧：上传和控制区
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 📤 上传图片")
+                        gr.Markdown("*拖拽或点击选择，自动进入队列*")
+                        gr.Markdown("💡 **提示**：透明材质完美扣除")
+                        matting_files = gr.File(
+                            label="选择图片（支持多选）",
+                            file_count="multiple",
+                            file_types=["image"],
+                            type="binary"
+                        )
+                        clear_matting_btn = gr.Button("🗑️ 清空队列", size="sm")
+
+                        gr.Markdown("---")
+                        matting_status = gr.Textbox(label="状态", interactive=False, lines=2)
+
+                    # 右侧：队列展示区
+                    with gr.Column(scale=4):
+                        gr.Markdown("### 📊 处理队列")
+                        matting_queue_display = gr.Dataframe(
+                            headers=["ID", "状态", "操作"],
+                            datatype=["str", "str", "str"],
+                            label="队列列表（点击行查看详情）",
+                            interactive=False
+                        )
+
+                        gr.Markdown("#### 🖼️ 图片查看（点击列表行查看，Tabs切换对比）")
+                        with gr.Tabs():
+                            with gr.Tab("📷 原图"):
+                                matting_original = gr.Image(label="原图", show_label=False, height=600, type="filepath")
+                            with gr.Tab("✨ 抠图后"):
+                                matting_result = gr.Image(label="抠图后", show_label=False, height=600, show_download_button=True, type="filepath")
+
+                # 隐藏的队列状态
+                matting_queue_state = gr.State(value=None)
+
+                # 自动处理：文件上传时自动添加到队列
+                matting_files.upload(
+                    fn=add_matting_to_queue,
+                    inputs=[matting_files, matting_queue_state],
+                    outputs=[matting_files, matting_queue_state, matting_queue_display, matting_status]
+                )
+
+                # 点击列表行显示图片
+                matting_queue_display.select(
+                    fn=handle_matting_dataframe_click,
+                    inputs=[matting_queue_state],
+                    outputs=[matting_original, matting_result]
+                )
+
+                # 清空队列
+                clear_matting_btn.click(
+                    fn=clear_matting_queue,
+                    outputs=[matting_queue_state, matting_queue_display, matting_status]
+                )
+
+                # 定时刷新队列显示（使用UI_REFRESH_INTERVAL优化性能）
+                matting_timer = gr.Timer(value=UI_REFRESH_INTERVAL, active=True)
+                matting_timer.tick(
+                    fn=get_matting_queue_status,
+                    inputs=[matting_queue_state],
+                    outputs=[matting_queue_state, matting_queue_display]
+                )
+
+            # 视频修复（第六栏 - 队列处理）
             with gr.Tab("🎬 视频修复"):
                 with gr.Row():
                     # 左侧：上传和控制区
@@ -2849,7 +3172,7 @@ def create_interface():
                         # 筛选控制栏
                         with gr.Row():
                             materials_type_filter = gr.Dropdown(
-                                choices=["全部", "图像优化", "去水印", "融图打光", "姿态迁移", "视频修复"],
+                                choices=["全部", "图像优化", "去水印", "融图打光", "姿态迁移", "抠图", "视频修复"],
                                 value="全部",
                                 label="类型筛选",
                                 scale=1
