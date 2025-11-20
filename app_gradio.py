@@ -96,6 +96,11 @@ ENHANCE_NODE_INFO_V2_1 = [
     {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"}
 ]
 
+# APIkey智能调度配置（成本优化）
+PRIMARY_API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"  # 便宜的key，前3个并发使用
+SECONDARY_API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"  # 贵的key，第4-50个并发使用
+PRIMARY_KEY_LIMIT = 3  # 便宜key的并发限制
+
 # 系统配置
 MAX_RETRIES = 3
 POLL_INTERVAL = 3  # API轮询间隔3秒（平衡速度和资源占用）
@@ -806,6 +811,21 @@ video_active_tasks = {}  # {task_id: start_time} 视频修复和抠图共享
 # 任务超时时间（秒）- 防止任务泄漏
 TASK_TIMEOUT = 3600  # 1小时超时自动清理
 
+def get_api_key_by_concurrency():
+    """
+    根据当前并发数智能选择APIkey（成本优化）
+    前3个并发使用便宜的key，第4-50个并发使用贵的key
+    """
+    with processing_lock:
+        total_active = len(active_tasks) + len(video_active_tasks)
+
+        if total_active < PRIMARY_KEY_LIMIT:
+            logger.debug(f"🔑 当前并发 {total_active}，使用PRIMARY_API_KEY (便宜)")
+            return PRIMARY_API_KEY
+        else:
+            logger.debug(f"🔑 当前并发 {total_active}，使用SECONDARY_API_KEY (贵)")
+            return SECONDARY_API_KEY
+
 # --- 风格提示词预设 ---
 STYLE_PROMPTS = {
     "默认": {
@@ -1000,6 +1020,9 @@ def process_single_item_wrapper(item):
 def process_single_item(item):
     """处理单个图片优化任务"""
     try:
+        # 动态选择APIkey（成本优化）
+        api_key = get_api_key_by_concurrency()
+
         # 更新状态为处理中，记录开始时间
         item["status"] = "processing"
         item["start_time"] = time.time()  # 记录开始时间用于倒计时
@@ -1047,7 +1070,7 @@ def process_single_item(item):
 
         # 上传文件
         logger.info(f"⬆️ 任务 {item['id']} 开始上传文件到API")
-        uploaded_filename = upload_file_with_retry(item["original"], f"input_{item['id']}.png", ENHANCE_API_KEY)
+        uploaded_filename = upload_file_with_retry(item["original"], f"input_{item['id']}.png", api_key)
 
         # 构建节点信息
         node_info_list = copy.deepcopy(node_info)
@@ -1092,14 +1115,14 @@ def process_single_item(item):
 
         # 启动任务
         logger.info(f"🎬 任务 {item['id']} 提交API处理请求 [{version}] instance_type={instance_type}")
-        task_id = run_task_with_retry(ENHANCE_API_KEY, webapp_id, node_info_list, instance_type=instance_type)
+        task_id = run_task_with_retry(api_key, webapp_id, node_info_list, instance_type=instance_type)
 
         # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
-            status = get_task_status(ENHANCE_API_KEY, task_id)
+            status = get_task_status(api_key, task_id)
 
             if status == "SUCCESS":
                 break
@@ -1111,7 +1134,7 @@ def process_single_item(item):
 
         # 获取结果
         logger.info(f"⬇️ 任务 {item['id']} 开始下载结果")
-        result_url = fetch_task_outputs(ENHANCE_API_KEY, task_id, "enhance")
+        result_url = fetch_task_outputs(api_key, task_id, "enhance")
         result_data = download_result_image(result_url)
 
         # 保存优化后的图片（强制转换为PNG格式）
@@ -1324,6 +1347,9 @@ def process_watermark_item_wrapper(item):
 def process_watermark_item(item):
     """处理单个去水印任务"""
     try:
+        # 动态选择APIkey（成本优化）
+        api_key = get_api_key_by_concurrency()
+
         # 更新状态为处理中，记录开始时间
         item["status"] = "processing"
         item["start_time"] = time.time()
@@ -1345,7 +1371,7 @@ def process_watermark_item(item):
 
         # 上传文件
         logger.info(f"⬆️ 去水印任务 {item['id']} 开始上传文件到API")
-        uploaded_filename = upload_file_with_retry(img_byte_arr, "input.png", WATERMARK_API_KEY)
+        uploaded_filename = upload_file_with_retry(img_byte_arr, "input.png", api_key)
 
         # 构建节点信息
         node_info_list = copy.deepcopy(WATERMARK_NODE_INFO)
@@ -1355,14 +1381,14 @@ def process_watermark_item(item):
 
         # 启动任务
         logger.info(f"🎬 去水印任务 {item['id']} 提交API处理请求")
-        task_id = run_task_with_retry(WATERMARK_API_KEY, WATERMARK_WEBAPP_ID, node_info_list)
+        task_id = run_task_with_retry(api_key, WATERMARK_WEBAPP_ID, node_info_list)
 
         # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
-            status = get_task_status(WATERMARK_API_KEY, task_id)
+            status = get_task_status(api_key, task_id)
 
             if status == "SUCCESS":
                 break
@@ -1374,7 +1400,7 @@ def process_watermark_item(item):
 
         # 获取结果
         logger.info(f"⬇️ 去水印任务 {item['id']} 开始下载结果")
-        result_url = fetch_task_outputs(WATERMARK_API_KEY, task_id, "watermark")
+        result_url = fetch_task_outputs(api_key, task_id, "watermark")
         result_data = download_result_image(result_url)
 
         # 转换为图片并保存为PNG
@@ -1575,6 +1601,9 @@ def process_pose_item_wrapper(item):
 def process_pose_item(item):
     """处理单个姿态迁移任务"""
     try:
+        # 动态选择APIkey（成本优化）
+        api_key = get_api_key_by_concurrency()
+
         # 更新状态为处理中，记录开始时间
         item["status"] = "processing"
         item["start_time"] = time.time()
@@ -1604,11 +1633,11 @@ def process_pose_item(item):
 
         # 上传角色图片
         logger.info(f"⬆️ 姿态迁移任务 {item['id']} 开始上传角色图到API")
-        char_filename = upload_file_with_retry(char_byte_arr, "character.jpg", POSE_API_KEY)
+        char_filename = upload_file_with_retry(char_byte_arr, "character.jpg", api_key)
 
         # 上传姿态图片
         logger.info(f"⬆️ 姿态迁移任务 {item['id']} 开始上传姿态图到API")
-        pose_filename = upload_file_with_retry(pose_byte_arr, "pose.jpg", POSE_API_KEY)
+        pose_filename = upload_file_with_retry(pose_byte_arr, "pose.jpg", api_key)
 
         # 构建节点信息
         node_info_list = copy.deepcopy(POSE_NODE_INFO_NEW)
@@ -1622,14 +1651,14 @@ def process_pose_item(item):
 
         # 启动任务
         logger.info(f"🎬 姿态迁移任务 {item['id']} 提交API处理请求 (强度: {item['strength']})")
-        task_id = run_task_with_retry(POSE_API_KEY, POSE_WEBAPP_ID_NEW, node_info_list)
+        task_id = run_task_with_retry(api_key, POSE_WEBAPP_ID_NEW, node_info_list)
 
         # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
-            status = get_task_status(POSE_API_KEY, task_id)
+            status = get_task_status(api_key, task_id)
 
             if status == "SUCCESS":
                 break
@@ -1641,7 +1670,7 @@ def process_pose_item(item):
 
         # 获取结果
         logger.info(f"⬇️ 姿态迁移任务 {item['id']} 开始下载结果")
-        result_urls = fetch_task_outputs(POSE_API_KEY, task_id, "pose")
+        result_urls = fetch_task_outputs(api_key, task_id, "pose")
 
         # 下载两张结果图片
         if result_urls and len(result_urls) >= 2:
@@ -1863,6 +1892,9 @@ def process_lighting_item_wrapper(item):
 def process_lighting_item(item):
     """处理单个融图打光任务"""
     try:
+        # 动态选择APIkey（成本优化）
+        api_key = get_api_key_by_concurrency()
+
         # 更新状态为处理中，记录开始时间
         item["status"] = "processing"
         item["start_time"] = time.time()
@@ -1884,7 +1916,7 @@ def process_lighting_item(item):
 
         # 上传文件
         logger.info(f"⬆️ 融图打光任务 {item['id']} 开始上传文件到API")
-        uploaded_filename = upload_file_with_retry(img_byte_arr, "input.png", LIGHTING_API_KEY)
+        uploaded_filename = upload_file_with_retry(img_byte_arr, "input.png", api_key)
 
         # 构建节点信息
         node_info_list = copy.deepcopy(LIGHTING_NODE_INFO)
@@ -1894,14 +1926,14 @@ def process_lighting_item(item):
 
         # 启动任务（使用plus实例类型）
         logger.info(f"🎬 融图打光任务 {item['id']} 提交API处理请求")
-        task_id = run_task_with_retry(LIGHTING_API_KEY, LIGHTING_WEBAPP_ID, node_info_list, instance_type="plus")
+        task_id = run_task_with_retry(api_key, LIGHTING_WEBAPP_ID, node_info_list, instance_type="plus")
 
         # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
-            status = get_task_status(LIGHTING_API_KEY, task_id)
+            status = get_task_status(api_key, task_id)
 
             if status == "SUCCESS":
                 break
@@ -1913,7 +1945,7 @@ def process_lighting_item(item):
 
         # 获取结果
         logger.info(f"⬇️ 融图打光任务 {item['id']} 开始下载结果")
-        result_url = fetch_task_outputs(LIGHTING_API_KEY, task_id, "lighting")
+        result_url = fetch_task_outputs(api_key, task_id, "lighting")
         result_data = download_result_image(result_url)
 
         # 转换为图片并保存
@@ -2101,6 +2133,9 @@ def process_matting_item_wrapper(item):
 def process_matting_item(item):
     """处理单个抠图任务"""
     try:
+        # 动态选择APIkey（成本优化）
+        api_key = get_api_key_by_concurrency()
+
         # 更新状态为处理中，记录开始时间
         item["status"] = "processing"
         item["start_time"] = time.time()
@@ -2117,7 +2152,7 @@ def process_matting_item(item):
 
         # 上传文件
         logger.info(f"⬆️ 抠图任务 {item['id']} 开始上传文件到API")
-        uploaded_filename = upload_file_with_retry(item["original"], "input.png", MATTING_API_KEY)
+        uploaded_filename = upload_file_with_retry(item["original"], "input.png", api_key)
 
         # 构建节点信息
         node_info_list = copy.deepcopy(MATTING_NODE_INFO)
@@ -2127,14 +2162,14 @@ def process_matting_item(item):
 
         # 启动任务
         logger.info(f"🎬 抠图任务 {item['id']} 提交API处理请求")
-        task_id = run_task_with_retry(MATTING_API_KEY, MATTING_WEBAPP_ID, node_info_list)
+        task_id = run_task_with_retry(api_key, MATTING_WEBAPP_ID, node_info_list)
 
         # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
-            status = get_task_status(MATTING_API_KEY, task_id)
+            status = get_task_status(api_key, task_id)
 
             if status == "SUCCESS":
                 break
@@ -2146,7 +2181,7 @@ def process_matting_item(item):
 
         # 获取结果
         logger.info(f"⬇️ 抠图任务 {item['id']} 开始下载结果")
-        result_url = fetch_task_outputs(MATTING_API_KEY, task_id, "matting")
+        result_url = fetch_task_outputs(api_key, task_id, "matting")
         result_data = download_result_image(result_url)
 
         # 转换为图片并保存
@@ -2333,6 +2368,9 @@ def process_video_restore_item_wrapper(item):
 def process_video_restore_item(item):
     """处理单个视频修复任务"""
     try:
+        # 动态选择APIkey（成本优化）
+        api_key = get_api_key_by_concurrency()
+
         # 更新状态为处理中，记录开始时间
         item["status"] = "processing"
         item["start_time"] = time.time()
@@ -2343,7 +2381,7 @@ def process_video_restore_item(item):
 
         # 上传视频文件
         logger.info(f"⬆️ 视频修复任务 {item['id']} 开始上传视频到API")
-        uploaded_filename = upload_file_with_retry(video_data, f"input_{item['id']}.mp4", VIDEO_RESTORE_API_KEY)
+        uploaded_filename = upload_file_with_retry(video_data, f"input_{item['id']}.mp4", api_key)
 
         # 构建节点信息
         node_info_list = copy.deepcopy(VIDEO_RESTORE_NODE_INFO)
@@ -2353,14 +2391,14 @@ def process_video_restore_item(item):
 
         # 启动任务
         logger.info(f"🎬 视频修复任务 {item['id']} 提交API处理请求")
-        task_id = run_task_with_retry(VIDEO_RESTORE_API_KEY, VIDEO_RESTORE_WEBAPP_ID, node_info_list, instance_type="plus")
+        task_id = run_task_with_retry(api_key, VIDEO_RESTORE_WEBAPP_ID, node_info_list, instance_type="plus")
 
         # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
-            status = get_task_status(VIDEO_RESTORE_API_KEY, task_id)
+            status = get_task_status(api_key, task_id)
 
             if status == "SUCCESS":
                 break
@@ -2372,7 +2410,7 @@ def process_video_restore_item(item):
 
         # 获取结果
         logger.info(f"⬇️ 视频修复任务 {item['id']} 开始下载结果")
-        result_url = fetch_task_outputs(VIDEO_RESTORE_API_KEY, task_id, "video")
+        result_url = fetch_task_outputs(api_key, task_id, "video")
         result_data = download_result_image(result_url)  # 虽然函数名是image，但也可以下载视频
 
         # 保存视频文件
