@@ -16,6 +16,7 @@ import os
 import json
 import shutil
 import gc  # 垃圾回收，用于及时释放内存
+import queue  # 使用线程安全的队列替代list
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +91,7 @@ ENHANCE_NODE_INFO_V2_1 = [
 
 # 系统配置
 MAX_RETRIES = 3
-POLL_INTERVAL = 6  # 从4秒增加到6秒，减少API轮询频率
+POLL_INTERVAL = 10  # 增加到10秒，减少API轮询频率和CPU占用
 MAX_POLL_COUNT = 240
 UPLOAD_TIMEOUT = 120
 RUN_TASK_TIMEOUT = 60
@@ -98,9 +99,11 @@ STATUS_CHECK_TIMEOUT = 25
 OUTPUT_FETCH_TIMEOUT = 90
 IMAGE_DOWNLOAD_TIMEOUT = 120
 
-# 性能优化配置（适配2核2GB服务器）
-MAX_CONCURRENT_TASKS = 8  # 实际同时处理的任务数限制（2核CPU建议不超过8-10个）
+# 性能优化配置（50并发，优化资源管理）
+MAX_CONCURRENT_TASKS = 50  # 保持50并发不变
 UI_REFRESH_INTERVAL = 2.0  # UI刷新间隔从0.5秒增加到2秒，减少CPU占用
+BACKGROUND_THREAD_LOCK = threading.Lock()  # 防止无限后台线程创建
+BACKGROUND_THREAD_ACTIVE = False  # 后台线程运行标志
 
 # 素材存储配置
 MATERIALS_BASE_DIR = "/home/user/TEST1/outputs"
@@ -780,11 +783,20 @@ watermark_queue_global = []  # 去水印队列
 lighting_queue_global = []  # 融图打光队列
 pose_queue_global = []  # 姿态迁移队列
 video_restore_queue_global = []  # 视频修复队列
+
+# 线程安全的任务队列（用于后台处理）
+task_queue = queue.Queue()  # 待处理任务队列
+
 processing_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=50)  # 50并发（图像优化、去水印、融图打光、姿态迁移共享）
 video_executor = ThreadPoolExecutor(max_workers=5)  # 5并发（视频修复专用）
-active_tasks = set()  # 跟踪活跃任务（图像类）
-video_active_tasks = set()  # 跟踪视频修复活跃任务
+
+# 使用字典而不是set，记录任务ID和开始时间，便于泄漏检测和清理
+active_tasks = {}  # {task_id: start_time}
+video_active_tasks = {}  # {task_id: start_time}
+
+# 任务超时时间（秒）- 防止任务泄漏
+TASK_TIMEOUT = 3600  # 1小时超时自动清理
 
 # --- 风格提示词预设 ---
 STYLE_PROMPTS = {
@@ -836,54 +848,98 @@ def add_to_queue(files, version, style, queue_state):
     # 清空文件选择器并更新显示
     return None, queue_state, render_queue_dataframe(queue_state), f"✅ 已添加 {len(files)} 张图片到队列，正在处理中..."
 
+def cleanup_stale_tasks():
+    """清理超时的僵尸任务，防止active_tasks泄漏"""
+    global active_tasks, video_active_tasks
+
+    current_time = time.time()
+
+    # 清理图像任务
+    stale_tasks = []
+    for task_id, start_time in active_tasks.items():
+        if current_time - start_time > TASK_TIMEOUT:
+            stale_tasks.append(task_id)
+            logger.warning(f"⚠️ 清理超时任务: {task_id} (运行时长: {int(current_time - start_time)}秒)")
+
+    for task_id in stale_tasks:
+        active_tasks.pop(task_id, None)
+
+    # 清理视频任务
+    stale_video_tasks = []
+    for task_id, start_time in video_active_tasks.items():
+        if current_time - start_time > TASK_TIMEOUT:
+            stale_video_tasks.append(task_id)
+            logger.warning(f"⚠️ 清理超时视频任务: {task_id} (运行时长: {int(current_time - start_time)}秒)")
+
+    for task_id in stale_video_tasks:
+        video_active_tasks.pop(task_id, None)
+
+def background_task_processor():
+    """单一后台线程处理所有任务（防止无限线程创建）"""
+    global BACKGROUND_THREAD_ACTIVE
+
+    logger.info("🚀 后台任务处理线程已启动")
+
+    while BACKGROUND_THREAD_ACTIVE:
+        try:
+            # 定期清理僵尸任务
+            cleanup_stale_tasks()
+
+            with processing_lock:
+                # 获取所有待处理的任务
+                pending_enhance_tasks = [task for task in enhance_queue_global if task["status"] == "pending"]
+                pending_watermark_tasks = [task for task in watermark_queue_global if task["status"] == "pending"]
+                pending_lighting_tasks = [task for task in lighting_queue_global if task["status"] == "pending"]
+                pending_pose_tasks = [task for task in pose_queue_global if task["status"] == "pending"]
+
+                # 合并所有待处理任务
+                all_pending_tasks = pending_enhance_tasks + pending_watermark_tasks + pending_lighting_tasks + pending_pose_tasks
+
+                # 计算可用槽位
+                available_slots = 50 - len(active_tasks)
+
+                # 提交新任务到线程池
+                for task in all_pending_tasks[:available_slots]:
+                    if task["id"] not in active_tasks:
+                        active_tasks[task["id"]] = time.time()  # 记录开始时间
+                        task_type_map = {
+                            "watermark": "去水印",
+                            "lighting": "融图打光",
+                            "pose": "姿态迁移",
+                        }
+                        task_type = task_type_map.get(task.get("task_type"), "图像优化")
+                        logger.info(f"🚀 提交任务到线程池: {task['id']} [{task_type}] (当前活跃: {len(active_tasks)}/50)")
+
+                        # 根据任务类型选择处理函数
+                        if task.get("task_type") == "watermark":
+                            executor.submit(process_watermark_item_wrapper, task)
+                        elif task.get("task_type") == "lighting":
+                            executor.submit(process_lighting_item_wrapper, task)
+                        elif task.get("task_type") == "pose":
+                            executor.submit(process_pose_item_wrapper, task)
+                        else:
+                            executor.submit(process_single_item_wrapper, task)
+
+            # 非阻塞等待（降低CPU占用）
+            time.sleep(2)
+
+        except Exception as e:
+            logger.error(f"❌ 后台任务处理线程异常: {e}")
+            time.sleep(5)
+
+    logger.info("🛑 后台任务处理线程已停止")
+
 def start_background_processing():
-    """启动后台处理线程（线程池50，实际并发受MAX_CONCURRENT_TASKS限制）"""
-    global active_tasks
+    """启动后台处理线程（只启动一次，防止无限线程创建）"""
+    global BACKGROUND_THREAD_ACTIVE
 
-    with processing_lock:
-        # 获取所有待处理的任务（图像优化）
-        pending_enhance_tasks = [task for task in enhance_queue_global if task["status"] == "pending"]
-
-        # 获取所有待处理的任务（去水印）
-        pending_watermark_tasks = [task for task in watermark_queue_global if task["status"] == "pending"]
-
-        # 获取所有待处理的任务（融图打光）
-        pending_lighting_tasks = [task for task in lighting_queue_global if task["status"] == "pending"]
-
-        # 获取所有待处理的任务（姿态迁移）
-        pending_pose_tasks = [task for task in pose_queue_global if task["status"] == "pending"]
-
-        # 计算可以启动的新任务数量（使用MAX_CONCURRENT_TASKS限制实际并发）
-        available_slots = min(MAX_CONCURRENT_TASKS - len(active_tasks), 50 - len(active_tasks))
-
-        # 如果没有可用槽位，不启动新任务
-        if available_slots <= 0:
-            return
-
-        # 合并所有待处理任务
-        all_pending_tasks = pending_enhance_tasks + pending_watermark_tasks + pending_lighting_tasks + pending_pose_tasks
-
-        # 提交新任务到线程池（最多启动available_slots个）
-        for task in all_pending_tasks[:available_slots]:
-            if task["id"] not in active_tasks:
-                active_tasks.add(task["id"])
-                task_type_map = {
-                    "watermark": "去水印",
-                    "lighting": "融图打光",
-                    "pose": "姿态迁移",
-                }
-                task_type = task_type_map.get(task.get("task_type"), "图像优化")
-                logger.info(f"🚀 提交任务到线程池: {task['id']} [{task_type}] (当前活跃: {len(active_tasks)}/{MAX_CONCURRENT_TASKS})")
-
-                # 根据任务类型选择处理函数
-                if task.get("task_type") == "watermark":
-                    executor.submit(process_watermark_item_wrapper, task)
-                elif task.get("task_type") == "lighting":
-                    executor.submit(process_lighting_item_wrapper, task)
-                elif task.get("task_type") == "pose":
-                    executor.submit(process_pose_item_wrapper, task)
-                else:
-                    executor.submit(process_single_item_wrapper, task)
+    # 使用锁防止重复启动
+    with BACKGROUND_THREAD_LOCK:
+        if not BACKGROUND_THREAD_ACTIVE:
+            BACKGROUND_THREAD_ACTIVE = True
+            thread = threading.Thread(target=background_task_processor, daemon=True, name="BackgroundTaskProcessor")
+            thread.start()
+            logger.info("✅ 后台任务处理线程已创建")
 
 def start_video_processing():
     """启动视频修复后台处理线程（限制2并发，视频处理更消耗资源）"""
@@ -914,15 +970,12 @@ def process_single_item_wrapper(item):
         item["status"] = "error"
         item["error"] = str(e)
     finally:
-        # 任务完成后从活跃集合中移除
+        # 任务完成后从活跃字典中移除（防止泄漏）
         with processing_lock:
-            active_tasks.discard(item["id"])
+            active_tasks.pop(item["id"], None)
 
-        # 强制垃圾回收，及时释放内存（重要：2GB内存需要及时清理）
+        # 强制垃圾回收，及时释放内存
         gc.collect()
-
-        # 尝试启动下一个任务
-        start_background_processing()
 
 def process_single_item(item):
     """处理单个图片优化任务"""
@@ -1241,15 +1294,12 @@ def process_watermark_item_wrapper(item):
         item["status"] = "error"
         item["error"] = str(e)
     finally:
-        # 任务完成后从活跃集合中移除
+        # 任务完成后从活跃字典中移除（防止泄漏）
         with processing_lock:
-            active_tasks.discard(item["id"])
+            active_tasks.pop(item["id"], None)
 
         # 强制垃圾回收，及时释放内存
         gc.collect()
-
-        # 尝试启动下一个任务
-        start_background_processing()
 
 def process_watermark_item(item):
     """处理单个去水印任务"""
@@ -1495,15 +1545,12 @@ def process_pose_item_wrapper(item):
         item["status"] = "error"
         item["error"] = str(e)
     finally:
-        # 任务完成后从活跃集合中移除
+        # 任务完成后从活跃字典中移除（防止泄漏）
         with processing_lock:
-            active_tasks.discard(item["id"])
+            active_tasks.pop(item["id"], None)
 
         # 强制垃圾回收，及时释放内存
         gc.collect()
-
-        # 尝试启动下一个任务
-        start_background_processing()
 
 def process_pose_item(item):
     """处理单个姿态迁移任务"""
@@ -1786,15 +1833,12 @@ def process_lighting_item_wrapper(item):
         item["status"] = "error"
         item["error"] = str(e)
     finally:
-        # 任务完成后从活跃集合中移除
+        # 任务完成后从活跃字典中移除（防止泄漏）
         with processing_lock:
-            active_tasks.discard(item["id"])
+            active_tasks.pop(item["id"], None)
 
         # 强制垃圾回收，及时释放内存
         gc.collect()
-
-        # 尝试启动下一个任务
-        start_background_processing()
 
 def process_lighting_item(item):
     """处理单个融图打光任务"""
@@ -2026,15 +2070,12 @@ def process_video_restore_item_wrapper(item):
         item["status"] = "error"
         item["error"] = str(e)
     finally:
-        # 任务完成后从活跃集合中移除
+        # 任务完成后从活跃字典中移除（防止泄漏）
         with processing_lock:
-            video_active_tasks.discard(item["id"])
+            video_active_tasks.pop(item["id"], None)
 
         # 强制垃圾回收，及时释放内存（视频处理占用更多内存）
         gc.collect()
-
-        # 尝试启动下一个任务
-        start_video_processing()
 
 def process_video_restore_item(item):
     """处理单个视频修复任务"""
