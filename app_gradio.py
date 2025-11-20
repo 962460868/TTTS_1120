@@ -772,10 +772,11 @@ def process_pose(character_image, reference_image):
 # 全局队列和处理标志
 enhance_queue_global = []
 watermark_queue_global = []  # 去水印队列
+lighting_queue_global = []  # 融图打光队列
 pose_queue_global = []  # 姿态迁移队列
 video_restore_queue_global = []  # 视频修复队列
 processing_lock = threading.Lock()
-executor = ThreadPoolExecutor(max_workers=50)  # 50并发（图像优化、去水印、姿态迁移共享）
+executor = ThreadPoolExecutor(max_workers=50)  # 50并发（图像优化、去水印、融图打光、姿态迁移共享）
 video_executor = ThreadPoolExecutor(max_workers=5)  # 5并发（视频修复专用）
 active_tasks = set()  # 跟踪活跃任务（图像类）
 video_active_tasks = set()  # 跟踪视频修复活跃任务
@@ -841,6 +842,9 @@ def start_background_processing():
         # 获取所有待处理的任务（去水印）
         pending_watermark_tasks = [task for task in watermark_queue_global if task["status"] == "pending"]
 
+        # 获取所有待处理的任务（融图打光）
+        pending_lighting_tasks = [task for task in lighting_queue_global if task["status"] == "pending"]
+
         # 获取所有待处理的任务（姿态迁移）
         pending_pose_tasks = [task for task in pose_queue_global if task["status"] == "pending"]
 
@@ -848,7 +852,7 @@ def start_background_processing():
         available_slots = 50 - len(active_tasks)
 
         # 合并所有待处理任务
-        all_pending_tasks = pending_enhance_tasks + pending_watermark_tasks + pending_pose_tasks
+        all_pending_tasks = pending_enhance_tasks + pending_watermark_tasks + pending_lighting_tasks + pending_pose_tasks
 
         # 提交新任务到线程池
         for task in all_pending_tasks[:available_slots]:
@@ -856,6 +860,7 @@ def start_background_processing():
                 active_tasks.add(task["id"])
                 task_type_map = {
                     "watermark": "去水印",
+                    "lighting": "融图打光",
                     "pose": "姿态迁移",
                 }
                 task_type = task_type_map.get(task.get("task_type"), "图像优化")
@@ -864,6 +869,8 @@ def start_background_processing():
                 # 根据任务类型选择处理函数
                 if task.get("task_type") == "watermark":
                     executor.submit(process_watermark_item_wrapper, task)
+                elif task.get("task_type") == "lighting":
+                    executor.submit(process_lighting_item_wrapper, task)
                 elif task.get("task_type") == "pose":
                     executor.submit(process_pose_item_wrapper, task)
                 else:
@@ -1716,6 +1723,244 @@ def clear_pose_queue():
     pose_queue_global = []
     return None, None, None, [], "✅ 队列已清空"
 
+# --- 融图打光队列管理函数 ---
+def add_lighting_to_queue(files, queue_state):
+    """添加文件到融图打光队列（自动触发）"""
+    global lighting_queue_global
+
+    if not files:
+        return None, queue_state, render_lighting_queue_dataframe(queue_state), "⚠️ 未选择文件"
+
+    # 初始化队列
+    if queue_state is None:
+        queue_state = []
+
+    # 添加新文件到队列
+    for file in files:
+        file_id = str(uuid.uuid4())[:8]
+        item = {
+            "id": file_id,
+            "file": file,
+            "task_type": "lighting",  # 标记为融图打光任务
+            "status": "pending",
+            "original": None,
+            "result": None,
+            "error": None,
+            "start_time": None
+        }
+        queue_state.append(item)
+        lighting_queue_global.append(item)
+
+    # 启动后台处理
+    start_background_processing()
+
+    # 清空文件选择器并更新显示
+    return None, queue_state, render_lighting_queue_dataframe(queue_state), f"✅ 已添加 {len(files)} 张图片到队列，正在处理中..."
+
+def process_lighting_item_wrapper(item):
+    """包装器：处理单个融图打光任务并更新活跃任务集"""
+    global active_tasks
+
+    try:
+        process_lighting_item(item)
+    except Exception as e:
+        logger.error(f"融图打光任务失败: {e}")
+        item["status"] = "error"
+        item["error"] = str(e)
+    finally:
+        # 任务完成后从活跃集合中移除
+        with processing_lock:
+            active_tasks.discard(item["id"])
+
+        # 尝试启动下一个任务
+        start_background_processing()
+
+def process_lighting_item(item):
+    """处理单个融图打光任务"""
+    try:
+        # 更新状态为处理中，记录开始时间
+        item["status"] = "processing"
+        item["start_time"] = time.time()
+        logger.info(f"📝 融图打光任务 {item['id']} 状态: pending -> processing")
+
+        # 读取图片文件
+        img_data = item["file"]
+        img = Image.open(io.BytesIO(img_data))
+
+        # 保存原图（转为PNG）
+        original_buffer = io.BytesIO()
+        img.save(original_buffer, format='PNG')
+        item["original"] = original_buffer.getvalue()
+
+        # 转换图片格式
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        img_byte_arr = img_byte_arr.getvalue()
+
+        # 上传文件
+        logger.info(f"⬆️ 融图打光任务 {item['id']} 开始上传文件到API")
+        uploaded_filename = upload_file_with_retry(img_byte_arr, "input.png", LIGHTING_API_KEY)
+
+        # 构建节点信息
+        node_info_list = copy.deepcopy(LIGHTING_NODE_INFO)
+        for node in node_info_list:
+            if node["nodeId"] == "437":
+                node["fieldValue"] = uploaded_filename
+
+        # 启动任务（使用plus实例类型）
+        logger.info(f"🎬 融图打光任务 {item['id']} 提交API处理请求")
+        task_id = run_task_with_retry(LIGHTING_API_KEY, LIGHTING_WEBAPP_ID, node_info_list, instance_type="plus")
+
+        # 轮询状态
+        poll_count = 0
+        while poll_count < MAX_POLL_COUNT:
+            time.sleep(POLL_INTERVAL)
+            poll_count += 1
+            status = get_task_status(LIGHTING_API_KEY, task_id)
+
+            if status == "SUCCESS":
+                break
+            elif status == "FAILED":
+                raise Exception("API任务处理失败")
+
+        if poll_count >= MAX_POLL_COUNT:
+            raise Exception("任务超时")
+
+        # 获取结果
+        logger.info(f"⬇️ 融图打光任务 {item['id']} 开始下载结果")
+        result_url = fetch_task_outputs(LIGHTING_API_KEY, task_id, "lighting")
+        result_data = download_result_image(result_url)
+
+        # 转换为图片并保存
+        result_image = Image.open(io.BytesIO(result_data))
+        result_buffer = io.BytesIO()
+        result_image.save(result_buffer, format='PNG')
+        item["result"] = result_buffer.getvalue()
+        logger.info(f"💾 融图打光任务 {item['id']} 已保存为PNG格式")
+
+        # 保存到永久存储
+        try:
+            save_material_to_storage(
+                task_id=item["id"],
+                task_type="lighting",
+                parameters={},
+                original_data=item["original"],
+                result_data_list=[(item["result"], 'png')]
+            )
+        except Exception as e:
+            logger.error(f"保存素材到永久存储失败: {e}")
+
+        # 更新状态为完成
+        item["status"] = "completed"
+        logger.info(f"✅ 融图打光任务 {item['id']} 完成！")
+
+    except Exception as e:
+        item["status"] = "error"
+        item["error"] = str(e)
+        logger.error(f"❌ 融图打光任务 {item['id']} 失败: {str(e)}")
+        raise
+
+def get_lighting_queue_status(queue_state):
+    """获取融图打光队列状态（定时刷新）"""
+    if queue_state is None:
+        return queue_state, []
+    return queue_state, render_lighting_queue_dataframe(queue_state)
+
+def render_lighting_queue_dataframe(queue_state):
+    """渲染融图打光队列为DataFrame数据"""
+    if not queue_state:
+        return []
+
+    data = []
+    for item in queue_state:
+        # 状态显示逻辑
+        status = item["status"]
+        if status == "pending":
+            status_display = "⏳ 等待中"
+        elif status == "processing":
+            start_time = item.get("start_time")
+            if start_time:
+                elapsed = time.time() - start_time
+                remaining = 180 - elapsed  # 180秒 = 3分钟（融图打光可能需要更长时间）
+
+                if remaining > 0:
+                    minutes = int(remaining // 60)
+                    seconds = int(remaining % 60)
+                    status_display = f"预计还剩{minutes}:{seconds:02d}"
+                else:
+                    status_display = "全力处理中~"
+            else:
+                status_display = "🔄 处理中"
+        elif status == "completed":
+            status_display = "✅ 已完成"
+        elif status == "error":
+            status_display = "❌ 失败"
+        else:
+            status_display = "未知"
+
+        # 操作列
+        view_text = "点击查看" if status == "completed" else "---"
+
+        data.append([
+            item["id"],
+            status_display,
+            view_text
+        ])
+
+    return data
+
+def handle_lighting_dataframe_click(evt: gr.SelectData, queue_state):
+    """处理融图打光DataFrame点击事件"""
+    if not queue_state or evt.index[0] >= len(queue_state):
+        return None, None
+
+    row_index = evt.index[0]
+    item = queue_state[row_index]
+
+    # 显示图片
+    if item["status"] == "completed" and item["original"] and item["result"]:
+        # 转换为PIL Image
+        original_img = Image.open(io.BytesIO(item["original"]))
+        result_img = Image.open(io.BytesIO(item["result"]))
+
+        # 统一高度到800px
+        target_height = 800
+
+        # 调整原图大小
+        orig_width, orig_height = original_img.size
+        if orig_height != target_height:
+            scale = target_height / orig_height
+            new_width = int(orig_width * scale)
+            original_img = original_img.resize((new_width, target_height), Image.LANCZOS)
+
+        # 调整结果图大小
+        result_width, result_height = result_img.size
+        if result_height != target_height:
+            scale = target_height / result_height
+            new_width = int(result_width * scale)
+            result_img = result_img.resize((new_width, target_height), Image.LANCZOS)
+
+        # 保存为PNG临时文件
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='_original.png', mode='wb') as f:
+            original_img.save(f, format='PNG')
+            original_temp_path = f.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='_lighting.png', mode='wb') as f:
+            result_img.save(f, format='PNG')
+            result_temp_path = f.name
+
+        return original_temp_path, result_temp_path
+
+    return None, None
+
+def clear_lighting_queue():
+    """清空融图打光队列"""
+    global lighting_queue_global
+    lighting_queue_global = []
+    return None, [], "✅ 队列已清空"
+
 # --- 视频修复队列管理函数 ---
 def add_video_restore_to_queue(files, queue_state):
     """添加视频文件到修复队列（自动触发）"""
@@ -2259,13 +2504,80 @@ def create_interface():
                     outputs=[watermark_queue_state, watermark_queue_display]
                 )
 
-            # 姿态迁移（第三栏 - 队列处理）
+            # 融图打光（第三栏 - 队列处理）
+            with gr.Tab("💡 融图打光"):
+                with gr.Row():
+                    # 左侧：上传和控制区
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 📤 上传图片")
+                        gr.Markdown("*拖拽或点击选择，自动进入队列*")
+                        gr.Markdown("💡 **建议**：单张图片不超过10MB，支持JPG/PNG格式")
+                        lighting_files = gr.File(
+                            label="选择图片（支持多选）",
+                            file_count="multiple",
+                            file_types=["image"],
+                            type="binary"
+                        )
+                        clear_lighting_btn = gr.Button("🗑️ 清空队列", size="sm")
+
+                        gr.Markdown("---")
+                        lighting_status = gr.Textbox(label="状态", interactive=False, lines=2)
+
+                    # 右侧：队列展示区
+                    with gr.Column(scale=4):
+                        gr.Markdown("### 📊 处理队列")
+                        lighting_queue_display = gr.Dataframe(
+                            headers=["ID", "状态", "操作"],
+                            datatype=["str", "str", "str"],
+                            label="队列列表（点击行查看详情）",
+                            interactive=False
+                        )
+
+                        gr.Markdown("#### 🖼️ 图片查看（点击列表行查看，Tabs切换对比）")
+                        with gr.Tabs():
+                            with gr.Tab("📷 原图"):
+                                lighting_original = gr.Image(label="原图", show_label=False, height=600, type="filepath")
+                            with gr.Tab("✨ 打光后"):
+                                lighting_result = gr.Image(label="打光后", show_label=False, height=600, show_download_button=True, type="filepath")
+
+                # 隐藏的队列状态
+                lighting_queue_state = gr.State(value=None)
+
+                # 自动处理：文件上传时自动添加到队列
+                lighting_files.upload(
+                    fn=add_lighting_to_queue,
+                    inputs=[lighting_files, lighting_queue_state],
+                    outputs=[lighting_files, lighting_queue_state, lighting_queue_display, lighting_status]
+                )
+
+                # 点击列表行显示图片
+                lighting_queue_display.select(
+                    fn=handle_lighting_dataframe_click,
+                    inputs=[lighting_queue_state],
+                    outputs=[lighting_original, lighting_result]
+                )
+
+                # 清空队列
+                clear_lighting_btn.click(
+                    fn=clear_lighting_queue,
+                    outputs=[lighting_queue_state, lighting_queue_display, lighting_status]
+                )
+
+                # 定时刷新队列显示
+                lighting_timer = gr.Timer(value=0.5, active=True)
+                lighting_timer.tick(
+                    fn=get_lighting_queue_status,
+                    inputs=[lighting_queue_state],
+                    outputs=[lighting_queue_state, lighting_queue_display]
+                )
+
+            # 姿态迁移（第四栏 - 队列处理）
             with gr.Tab("🎭 姿态迁移"):
                 with gr.Row():
                     # 左侧：上传和控制区
                     with gr.Column(scale=1):
                         gr.Markdown("### 📤 上传图片")
-                        gr.Markdown("*分别上传角色图和姿态图，自动进入队列*")
+                        gr.Markdown("*分别上传角色图和姿态图，点击开始处理按钮*")
                         gr.Markdown("💡 **建议**：单张图片不超过10MB")
 
                         pose_character_files = gr.File(
@@ -2290,6 +2602,9 @@ def create_interface():
                             label="强度值 (4=角色相似度 ←→ 15=姿态相似度)"
                         )
 
+                        # 开始处理按钮
+                        start_pose_btn = gr.Button("🚀 开始处理", variant="primary", size="lg")
+
                         clear_pose_btn = gr.Button("🗑️ 清空队列", size="sm")
 
                         gr.Markdown("---")
@@ -2313,25 +2628,9 @@ def create_interface():
                 # 隐藏的队列状态
                 pose_queue_state = gr.State(value=None)
 
-                # 自动处理：文件上传时自动添加到队列
-                # 使用change事件监听两个文件上传组件
-                def trigger_pose_queue(char_files, pose_files, strength, queue_state):
-                    """触发姿态迁移队列处理"""
-                    if char_files and pose_files:
-                        return add_pose_to_queue(char_files, pose_files, strength, queue_state)
-                    else:
-                        # 如果任一为空，返回当前状态
-                        return None, None, queue_state, render_pose_queue_dataframe(queue_state), ""
-
-                # 当角色图或姿态图上传时触发
-                pose_character_files.upload(
-                    fn=trigger_pose_queue,
-                    inputs=[pose_character_files, pose_pose_files, pose_strength, pose_queue_state],
-                    outputs=[pose_character_files, pose_pose_files, pose_queue_state, pose_queue_display, pose_status]
-                )
-
-                pose_pose_files.upload(
-                    fn=trigger_pose_queue,
+                # 点击"开始处理"按钮触发
+                start_pose_btn.click(
+                    fn=add_pose_to_queue,
                     inputs=[pose_character_files, pose_pose_files, pose_strength, pose_queue_state],
                     outputs=[pose_character_files, pose_pose_files, pose_queue_state, pose_queue_display, pose_status]
                 )
