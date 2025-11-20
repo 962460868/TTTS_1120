@@ -2157,15 +2157,16 @@ def clear_video_restore_queue():
     return None, [], [], "✅ 队列已清空"
 
 # --- 生成素材管理函数 ---
-def get_materials(task_type_filter="全部", date_filter="全部", search_query="", limit=20):
+def get_materials(task_type_filter="全部", date_filter="全部", search_query="", limit=20, offset=0):
     """
-    获取素材列表（优化版：减少初始加载量）
+    获取素材列表（支持分批加载）
 
     Args:
         task_type_filter: 类型筛选
         date_filter: 日期筛选
         search_query: 搜索关键词
-        limit: 返回记录数（默认20，优化加载速度）
+        limit: 每批返回记录数（默认20）
+        offset: 偏移量（用于分批加载）
     """
     try:
         conn = sqlite3.connect(MATERIALS_DB_PATH)
@@ -2180,6 +2181,7 @@ def get_materials(task_type_filter="全部", date_filter="全部", search_query=
             task_type_map = {
                 "图像优化": "image_enhance",
                 "去水印": "watermark_removal",
+                "融图打光": "lighting",
                 "姿态迁移": "pose_transfer",
                 "视频修复": "video_restore"
             }
@@ -2205,7 +2207,7 @@ def get_materials(task_type_filter="全部", date_filter="全部", search_query=
             query += " AND id LIKE ?"
             params.append(f"%{search_query}%")
 
-        query += f" ORDER BY created_at DESC LIMIT {limit}"
+        query += f" ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
 
         cursor.execute(query, params)
         materials = cursor.fetchall()
@@ -2217,6 +2219,57 @@ def get_materials(task_type_filter="全部", date_filter="全部", search_query=
         logger.error(f"查询素材失败: {e}")
         return []
 
+def get_materials_count(task_type_filter="全部", date_filter="全部", search_query=""):
+    """获取符合条件的素材总数"""
+    try:
+        conn = sqlite3.connect(MATERIALS_DB_PATH)
+        cursor = conn.cursor()
+
+        # 构建查询
+        query = "SELECT COUNT(*) FROM materials WHERE 1=1"
+        params = []
+
+        # 类型筛选
+        if task_type_filter != "全部":
+            task_type_map = {
+                "图像优化": "image_enhance",
+                "去水印": "watermark_removal",
+                "融图打光": "lighting",
+                "姿态迁移": "pose_transfer",
+                "视频修复": "video_restore"
+            }
+            query += " AND task_type = ?"
+            params.append(task_type_map[task_type_filter])
+
+        # 日期筛选
+        if date_filter == "今天":
+            cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            query += " AND created_at >= ?"
+            params.append(cutoff.isoformat())
+        elif date_filter == "最近7天":
+            cutoff = datetime.now() - timedelta(days=7)
+            query += " AND created_at >= ?"
+            params.append(cutoff.isoformat())
+        elif date_filter == "最近30天":
+            cutoff = datetime.now() - timedelta(days=30)
+            query += " AND created_at >= ?"
+            params.append(cutoff.isoformat())
+
+        # 搜索查询
+        if search_query:
+            query += " AND id LIKE ?"
+            params.append(f"%{search_query}%")
+
+        cursor.execute(query, params)
+        count = cursor.fetchone()[0]
+        conn.close()
+
+        return count
+
+    except Exception as e:
+        logger.error(f"查询素材总数失败: {e}")
+        return 0
+
 def render_materials_gallery(materials):
     """渲染素材为Gallery格式"""
     gallery_data = []
@@ -2224,6 +2277,7 @@ def render_materials_gallery(materials):
     task_type_display = {
         "image_enhance": "图像优化",
         "watermark_removal": "去水印",
+        "lighting": "融图打光",
         "pose_transfer": "姿态迁移",
         "video_restore": "视频修复"
     }
@@ -2722,7 +2776,7 @@ def create_interface():
             # 资产管理（第五栏）
             with gr.Tab("📦 资产管理"):
                 gr.Markdown("### 🗂️ 资产库")
-                gr.Markdown("💡 **提示**：点击「🔄 刷新」按钮加载资产列表")
+                gr.Markdown("💡 **提示**：点击「🔄 刷新」加载资产，点击「⬇️ 加载更多」查看更多资产")
 
                 with gr.Row():
                     # 左侧：筛选和资产库
@@ -2730,7 +2784,7 @@ def create_interface():
                         # 筛选控制栏
                         with gr.Row():
                             materials_type_filter = gr.Dropdown(
-                                choices=["全部", "图像优化", "去水印", "姿态迁移", "视频修复"],
+                                choices=["全部", "图像优化", "去水印", "融图打光", "姿态迁移", "视频修复"],
                                 value="全部",
                                 label="类型筛选",
                                 scale=1
@@ -2758,6 +2812,11 @@ def create_interface():
                             object_fit="cover",
                             show_download_button=False
                         )
+
+                        # 加载更多按钮和状态显示
+                        with gr.Row():
+                            materials_load_more_btn = gr.Button("⬇️ 加载更多 (每次20个)", variant="secondary", size="lg")
+                            materials_count_display = gr.Markdown("*已加载: 0 / 总计: 0*")
 
                     # 右侧：资产详情
                     with gr.Column(scale=2):
@@ -2787,11 +2846,37 @@ def create_interface():
                         material_download_file = gr.File(label="下载文件", visible=False)
                         material_delete_status = gr.Textbox(label="状态", interactive=False, visible=False)
 
-                # 加载资产列表的函数
+                # 隐藏的状态变量
+                materials_offset = gr.State(value=0)  # 当前加载的偏移量
+                materials_current_data = gr.State(value=[])  # 当前已加载的数据
+
+                # 加载资产列表的函数（刷新 - 重新从头加载）
                 def load_materials_list(type_filter, date_filter, search_query):
-                    materials = get_materials(type_filter, date_filter, search_query)
+                    """刷新资产列表，从头开始加载"""
+                    materials = get_materials(type_filter, date_filter, search_query, limit=20, offset=0)
                     gallery_data = render_materials_gallery(materials)
-                    return gallery_data
+                    total_count = get_materials_count(type_filter, date_filter, search_query)
+                    loaded_count = len(gallery_data)
+                    count_text = f"*已加载: {loaded_count} / 总计: {total_count}*"
+
+                    return gallery_data, 20, gallery_data, count_text  # gallery, new_offset, current_data, count_display
+
+                # 加载更多资产的函数
+                def load_more_materials(type_filter, date_filter, search_query, current_offset, current_data):
+                    """加载更多资产，追加到现有列表"""
+                    materials = get_materials(type_filter, date_filter, search_query, limit=20, offset=current_offset)
+                    new_gallery_data = render_materials_gallery(materials)
+
+                    # 合并新数据到现有数据
+                    updated_data = current_data + new_gallery_data
+
+                    total_count = get_materials_count(type_filter, date_filter, search_query)
+                    loaded_count = len(updated_data)
+                    count_text = f"*已加载: {loaded_count} / 总计: {total_count}*"
+
+                    new_offset = current_offset + 20
+
+                    return updated_data, new_offset, updated_data, count_text  # gallery, new_offset, current_data, count_display
 
                 # 查看资产详情的函数
                 def view_material_detail(evt: gr.SelectData, gallery_data):
@@ -2865,42 +2950,49 @@ def create_interface():
                 # 删除资产的函数
                 def delete_selected_material(material_id, type_filter, date_filter, search_query):
                     if not material_id:
-                        return gr.update(value="⚠️ 未选择资产", visible=True), load_materials_list(type_filter, date_filter, search_query)
+                        return gr.update(value="⚠️ 未选择资产", visible=True), None, 0, [], "*已加载: 0 / 总计: 0*"
 
                     success, message = delete_material(material_id)
 
-                    # 刷新列表
-                    new_gallery = load_materials_list(type_filter, date_filter, search_query)
+                    # 刷新列表（返回值：gallery, offset, current_data, count_text）
+                    gallery, offset, current_data, count_text = load_materials_list(type_filter, date_filter, search_query)
 
-                    return gr.update(value=message, visible=True), new_gallery
+                    return gr.update(value=message, visible=True), gallery, offset, current_data, count_text
 
                 # 移除自动加载以优化页面初始加载速度
                 # 资产管理改为懒加载：仅在用户首次点击刷新按钮或筛选时才加载
                 # demo.load(...) 已移除
 
-                # 筛选和刷新
+                # 筛选和刷新（重新从头加载）
                 materials_type_filter.change(
                     fn=load_materials_list,
                     inputs=[materials_type_filter, materials_date_filter, materials_search],
-                    outputs=[materials_gallery]
+                    outputs=[materials_gallery, materials_offset, materials_current_data, materials_count_display]
                 )
 
                 materials_date_filter.change(
                     fn=load_materials_list,
                     inputs=[materials_type_filter, materials_date_filter, materials_search],
-                    outputs=[materials_gallery]
+                    outputs=[materials_gallery, materials_offset, materials_current_data, materials_count_display]
                 )
 
                 materials_search.submit(
                     fn=load_materials_list,
                     inputs=[materials_type_filter, materials_date_filter, materials_search],
-                    outputs=[materials_gallery]
+                    outputs=[materials_gallery, materials_offset, materials_current_data, materials_count_display]
                 )
 
                 materials_refresh_btn.click(
                     fn=load_materials_list,
                     inputs=[materials_type_filter, materials_date_filter, materials_search],
-                    outputs=[materials_gallery]
+                    outputs=[materials_gallery, materials_offset, materials_current_data, materials_count_display]
+                )
+
+                # 加载更多按钮
+                materials_load_more_btn.click(
+                    fn=load_more_materials,
+                    inputs=[materials_type_filter, materials_date_filter, materials_search, materials_offset, materials_current_data],
+                    outputs=[materials_gallery, materials_offset, materials_current_data, materials_count_display]
                 )
 
                 # 点击Gallery查看详情
@@ -2921,7 +3013,7 @@ def create_interface():
                 material_delete_btn.click(
                     fn=delete_selected_material,
                     inputs=[selected_material_id, materials_type_filter, materials_date_filter, materials_search],
-                    outputs=[material_delete_status, materials_gallery]
+                    outputs=[material_delete_status, materials_gallery, materials_offset, materials_current_data, materials_count_display]
                 )
 
     return demo
