@@ -15,6 +15,7 @@ import sqlite3
 import os
 import json
 import shutil
+import gc  # 垃圾回收，用于及时释放内存
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -89,13 +90,17 @@ ENHANCE_NODE_INFO_V2_1 = [
 
 # 系统配置
 MAX_RETRIES = 3
-POLL_INTERVAL = 4
+POLL_INTERVAL = 6  # 从4秒增加到6秒，减少API轮询频率
 MAX_POLL_COUNT = 240
 UPLOAD_TIMEOUT = 120
 RUN_TASK_TIMEOUT = 60
 STATUS_CHECK_TIMEOUT = 25
 OUTPUT_FETCH_TIMEOUT = 90
 IMAGE_DOWNLOAD_TIMEOUT = 120
+
+# 性能优化配置（适配2核2GB服务器）
+MAX_CONCURRENT_TASKS = 8  # 实际同时处理的任务数限制（2核CPU建议不超过8-10个）
+UI_REFRESH_INTERVAL = 2.0  # UI刷新间隔从0.5秒增加到2秒，减少CPU占用
 
 # 素材存储配置
 MATERIALS_BASE_DIR = "/home/user/TEST1/outputs"
@@ -832,7 +837,7 @@ def add_to_queue(files, version, style, queue_state):
     return None, queue_state, render_queue_dataframe(queue_state), f"✅ 已添加 {len(files)} 张图片到队列，正在处理中..."
 
 def start_background_processing():
-    """启动后台处理线程（支持50并发）"""
+    """启动后台处理线程（线程池50，实际并发受MAX_CONCURRENT_TASKS限制）"""
     global active_tasks
 
     with processing_lock:
@@ -848,13 +853,17 @@ def start_background_processing():
         # 获取所有待处理的任务（姿态迁移）
         pending_pose_tasks = [task for task in pose_queue_global if task["status"] == "pending"]
 
-        # 计算可以启动的新任务数量
-        available_slots = 50 - len(active_tasks)
+        # 计算可以启动的新任务数量（使用MAX_CONCURRENT_TASKS限制实际并发）
+        available_slots = min(MAX_CONCURRENT_TASKS - len(active_tasks), 50 - len(active_tasks))
+
+        # 如果没有可用槽位，不启动新任务
+        if available_slots <= 0:
+            return
 
         # 合并所有待处理任务
         all_pending_tasks = pending_enhance_tasks + pending_watermark_tasks + pending_lighting_tasks + pending_pose_tasks
 
-        # 提交新任务到线程池
+        # 提交新任务到线程池（最多启动available_slots个）
         for task in all_pending_tasks[:available_slots]:
             if task["id"] not in active_tasks:
                 active_tasks.add(task["id"])
@@ -864,7 +873,7 @@ def start_background_processing():
                     "pose": "姿态迁移",
                 }
                 task_type = task_type_map.get(task.get("task_type"), "图像优化")
-                logger.info(f"🚀 提交任务到线程池: {task['id']} [{task_type}] (当前活跃: {len(active_tasks)}/50)")
+                logger.info(f"🚀 提交任务到线程池: {task['id']} [{task_type}] (当前活跃: {len(active_tasks)}/{MAX_CONCURRENT_TASKS})")
 
                 # 根据任务类型选择处理函数
                 if task.get("task_type") == "watermark":
@@ -877,15 +886,15 @@ def start_background_processing():
                     executor.submit(process_single_item_wrapper, task)
 
 def start_video_processing():
-    """启动视频修复后台处理线程（支持5并发）"""
+    """启动视频修复后台处理线程（限制2并发，视频处理更消耗资源）"""
     global video_active_tasks
 
     with processing_lock:
         # 获取所有待处理的视频修复任务
         pending_video_tasks = [task for task in video_restore_queue_global if task["status"] == "pending"]
 
-        # 计算可以启动的新任务数量
-        available_slots = 5 - len(video_active_tasks)
+        # 计算可以启动的新任务数量（视频处理限制为2，避免内存溢出）
+        available_slots = min(2 - len(video_active_tasks), 5 - len(video_active_tasks))
 
         # 提交新任务到视频线程池
         for task in pending_video_tasks[:available_slots]:
@@ -908,6 +917,9 @@ def process_single_item_wrapper(item):
         # 任务完成后从活跃集合中移除
         with processing_lock:
             active_tasks.discard(item["id"])
+
+        # 强制垃圾回收，及时释放内存（重要：2GB内存需要及时清理）
+        gc.collect()
 
         # 尝试启动下一个任务
         start_background_processing()
@@ -1233,6 +1245,9 @@ def process_watermark_item_wrapper(item):
         with processing_lock:
             active_tasks.discard(item["id"])
 
+        # 强制垃圾回收，及时释放内存
+        gc.collect()
+
         # 尝试启动下一个任务
         start_background_processing()
 
@@ -1483,6 +1498,9 @@ def process_pose_item_wrapper(item):
         # 任务完成后从活跃集合中移除
         with processing_lock:
             active_tasks.discard(item["id"])
+
+        # 强制垃圾回收，及时释放内存
+        gc.collect()
 
         # 尝试启动下一个任务
         start_background_processing()
@@ -1772,6 +1790,9 @@ def process_lighting_item_wrapper(item):
         with processing_lock:
             active_tasks.discard(item["id"])
 
+        # 强制垃圾回收，及时释放内存
+        gc.collect()
+
         # 尝试启动下一个任务
         start_background_processing()
 
@@ -2008,6 +2029,9 @@ def process_video_restore_item_wrapper(item):
         # 任务完成后从活跃集合中移除
         with processing_lock:
             video_active_tasks.discard(item["id"])
+
+        # 强制垃圾回收，及时释放内存（视频处理占用更多内存）
+        gc.collect()
 
         # 尝试启动下一个任务
         start_video_processing()
@@ -2483,8 +2507,8 @@ def create_interface():
                     outputs=[queue_state, queue_display, enhance_status]
                 )
 
-                # 定时刷新队列显示（0.5秒更新一次，更及时）
-                timer = gr.Timer(value=0.5, active=True)
+                # 定时刷新队列显示（使用UI_REFRESH_INTERVAL优化性能）
+                timer = gr.Timer(value=UI_REFRESH_INTERVAL, active=True)
                 timer.tick(
                     fn=get_queue_status,
                     inputs=[queue_state],
@@ -2550,8 +2574,8 @@ def create_interface():
                     outputs=[watermark_queue_state, watermark_queue_display, watermark_status]
                 )
 
-                # 定时刷新队列显示
-                watermark_timer = gr.Timer(value=0.5, active=True)
+                # 定时刷新队列显示（使用UI_REFRESH_INTERVAL优化性能）
+                watermark_timer = gr.Timer(value=UI_REFRESH_INTERVAL, active=True)
                 watermark_timer.tick(
                     fn=get_watermark_queue_status,
                     inputs=[watermark_queue_state],
@@ -2617,8 +2641,8 @@ def create_interface():
                     outputs=[lighting_queue_state, lighting_queue_display, lighting_status]
                 )
 
-                # 定时刷新队列显示
-                lighting_timer = gr.Timer(value=0.5, active=True)
+                # 定时刷新队列显示（使用UI_REFRESH_INTERVAL优化性能）
+                lighting_timer = gr.Timer(value=UI_REFRESH_INTERVAL, active=True)
                 lighting_timer.tick(
                     fn=get_lighting_queue_status,
                     inputs=[lighting_queue_state],
@@ -2702,8 +2726,8 @@ def create_interface():
                     outputs=[pose_character_files, pose_pose_files, pose_queue_state, pose_queue_display, pose_status]
                 )
 
-                # 定时刷新队列显示
-                pose_timer = gr.Timer(value=0.5, active=True)
+                # 定时刷新队列显示（使用UI_REFRESH_INTERVAL优化性能）
+                pose_timer = gr.Timer(value=UI_REFRESH_INTERVAL, active=True)
                 pose_timer.tick(
                     fn=get_pose_queue_status,
                     inputs=[pose_queue_state],
@@ -2765,8 +2789,8 @@ def create_interface():
                     outputs=[video_restore_files, video_restore_queue_state, video_restore_queue_display, video_restore_status]
                 )
 
-                # 定时刷新队列显示
-                video_restore_timer = gr.Timer(value=0.5, active=True)
+                # 定时刷新队列显示（使用UI_REFRESH_INTERVAL优化性能）
+                video_restore_timer = gr.Timer(value=UI_REFRESH_INTERVAL, active=True)
                 video_restore_timer.tick(
                     fn=get_video_restore_queue_status,
                     inputs=[video_restore_queue_state],
